@@ -1,91 +1,29 @@
 #!/bin/bash
+# Політика паролів Ubuntu. Адміни (групи sudo/admin/wheel) не чіпаються.
+# REVERT_ADMINS=1 ./script.sh  - одноразово повернути адмінам "пароль не спливає"
+# SOFT_START=0 - не скидати дату зміни пароля при першому застосуванні
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "ERROR: потрібен root"; exit 1; }
 
-set -e
+MAXDAYS=90
+SOFT_START=${SOFT_START:-1}
+REVERT_ADMINS=${REVERT_ADMINS:-0}
+CHANGED=""
 
-# Потрібно запускати від root
-if [ "$EUID" -ne 0 ]; then
-    echo "Необхідно запускати від root"
-    exit 1
-fi
+is_admin() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|admin|wheel'; }
 
-echo "===== Password Policy ====="
-
-########################################
-# Перевірка чи вже все налаштовано
-########################################
-
-OK=1
-
-# PASS_MAX_DAYS
-grep -q '^PASS_MAX_DAYS[[:space:]]\+90$' /etc/login.defs || OK=0
-
-# PASS_MIN_DAYS
-grep -q '^PASS_MIN_DAYS[[:space:]]\+0$' /etc/login.defs || OK=0
-
-# pwquality.conf
-grep -q '^minlen[[:space:]]*=[[:space:]]*12$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^ucredit[[:space:]]*=[[:space:]]*-1$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^lcredit[[:space:]]*=[[:space:]]*-1$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^dcredit[[:space:]]*=[[:space:]]*-1$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^ocredit[[:space:]]*=[[:space:]]*-1$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^minclass[[:space:]]*=[[:space:]]*4$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^maxrepeat[[:space:]]*=[[:space:]]*3$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-grep -q '^difok[[:space:]]*=[[:space:]]*4$' /etc/security/pwquality.conf 2>/dev/null || OK=0
-
-# remember=5
-grep -q 'remember=5' /etc/pam.d/common-password 2>/dev/null || OK=0
-
-########################################
-# Якщо вже налаштовано
-########################################
-
-if [ "$OK" -eq 1 ]; then
-    echo "Політика паролів вже застосована."
-    exit 0
-fi
-
-echo "Застосовую політику..."
-
-########################################
-# Встановлення libpam-pwquality
-########################################
-
+# 1. Пакет
 if ! dpkg -s libpam-pwquality >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y libpam-pwquality
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq libpam-pwquality >/dev/null \
+        || { echo "ERROR: apt"; exit 1; }
+    CHANGED="$CHANGED pkg"
 fi
 
-########################################
-# login.defs
-########################################
-
-sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' /etc/login.defs
-grep -q '^PASS_MAX_DAYS' /etc/login.defs || echo "PASS_MAX_DAYS   90" >> /etc/login.defs
-
-sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   0/' /etc/login.defs
-grep -q '^PASS_MIN_DAYS' /etc/login.defs || echo "PASS_MIN_DAYS   0" >> /etc/login.defs
-
-########################################
-# Усі локальні користувачі
-########################################
-
-awk -F: '$3>=1000 && $7!="/usr/sbin/nologin" && $7!="/bin/false"{print $1}' /etc/passwd |
-while read USER
-do
-    echo "Налаштовую користувача $USER"
-
-    chage -M 90 "$USER"
-
-    # Якщо не хочеш примушувати змінювати пароль відразу,
-    # відлік почнеться з поточної дати
-    chage -d "$(date +%F)" "$USER"
-done
-
-########################################
-# pwquality.conf
-########################################
-
-cat >/etc/security/pwquality.conf <<EOF
+# 2. Вимоги до пароля (окремий файл, основний не перезаписується)
+mkdir -p /etc/security/pwquality.conf.d
+TMP=$(mktemp)
+cat >"$TMP" <<'EOF'
 minlen = 12
 ucredit = -1
 lcredit = -1
@@ -97,28 +35,52 @@ difok = 4
 usercheck = 1
 dictcheck = 1
 EOF
+if ! cmp -s "$TMP" /etc/security/pwquality.conf.d/99-policy.conf; then
+    install -m 644 "$TMP" /etc/security/pwquality.conf.d/99-policy.conf
+    CHANGED="$CHANGED pwquality"
+fi
+rm -f "$TMP"
 
-########################################
-# PAM
-########################################
-
-PAM="/etc/pam.d/common-password"
-
-if grep -q "pam_pwquality.so" "$PAM"; then
-
-    sed -Ei 's/minlen=[0-9]+/minlen=12/g' "$PAM"
-
-    grep -q "remember=5" "$PAM" || \
-    sed -Ei 's/pam_unix.so/& remember=5/' "$PAM"
-
+# 3. PAM: pwquality + історія паролів (лише активні рядки, не коментарі)
+PAM=/etc/pam.d/common-password
+cp -n "$PAM" "$PAM.bak.policy"
+BEFORE=$(cksum <"$PAM")
+if grep -Eq '^password[[:space:]].*pam_pwquality\.so' "$PAM"; then
+    sed -Ei '/^password[[:space:]].*pam_pwquality\.so/s/minlen=[0-9]+/minlen=12/' "$PAM"
 else
+    sed -Ei '0,/^password[[:space:]].*pam_unix\.so/s//password requisite pam_pwquality.so retry=3\n&/' "$PAM"
+fi
+sed -Ei '/^password[[:space:]].*pam_unix\.so/s/remember=[0-9]+/remember=5/' "$PAM"
+sed -Ei '/^password[[:space:]].*pam_unix\.so/{/remember=/!s/$/ remember=5/}' "$PAM"
+[ "$BEFORE" = "$(cksum <"$PAM")" ] || CHANGED="$CHANGED pam"
 
-    sed -Ei '/pam_unix.so/i password requisite pam_pwquality.so retry=3 minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 minclass=4 maxrepeat=3 difok=4 usercheck=1 dictcheck=1' "$PAM"
+[ -f /etc/security/opasswd ] || { touch /etc/security/opasswd; chmod 600 /etc/security/opasswd; }
 
-    sed -Ei 's/pam_unix.so/& remember=5/' "$PAM"
+# 4. Користувачі. login.defs не чіпаємо, щоб нові адміни не отримували 90 днів
+while read -r u; do
+    pw=$(getent shadow "$u" | cut -d: -f2)
+    case "$pw" in ''|'!'*|'*'*) continue ;; esac   # без пароля або заблокований
+    cur=$(getent shadow "$u" | cut -d: -f5)
 
+    if is_admin "$u"; then
+        if [ "$REVERT_ADMINS" = 1 ] && [ "$cur" = "$MAXDAYS" ]; then
+            chage -M 99999 "$u"
+            CHANGED="$CHANGED revert:$u"
+        fi
+        continue
+    fi
+
+    if [ "$cur" != "$MAXDAYS" ]; then
+        chage -M "$MAXDAYS" "$u"
+        [ "$SOFT_START" = 1 ] && chage -d "$(date +%F)" "$u"
+        CHANGED="$CHANGED fixed:$u"
+    fi
+done < <(awk -F: '$3>=1000 && $3<65534 && $7!~/(nologin|false)$/ {print $1}' /etc/passwd)
+
+# 5. Відкат системного значення, яке виставила стара версія скрипта (лише з REVERT_ADMINS=1)
+if [ "$REVERT_ADMINS" = 1 ] && grep -Eq "^PASS_MAX_DAYS[[:space:]]+$MAXDAYS$" /etc/login.defs; then
+    sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   99999/' /etc/login.defs
+    CHANGED="$CHANGED login.defs"
 fi
 
-echo "Політика паролів успішно застосована."
-
-exit 0
+if [ -z "$CHANGED" ]; then echo "ALREADY_APPLIED"; else echo "APPLIED_SUCCESS:$CHANGED"; fi
