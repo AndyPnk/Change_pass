@@ -4,7 +4,7 @@
 # Використання (від root):
 #   ./pwpolicy.sh            застосувати політику (те саме, що apply)
 #   ./pwpolicy.sh check      лише перевірити, нічого не змінює (для Zabbix)
-#   ./pwpolicy.sh revert-admins   повернути адмінам "пароль не спливає"
+#   ./pwpolicy.sh revert-admins   лише зняти термін дії в адмінів (apply робить це теж)
 #
 # Вивід завжди одним рядком:
 #   apply:  ALREADY_APPLIED | APPLIED_SUCCESS: <що змінено> | ERROR: <причина>
@@ -100,6 +100,12 @@ if [ "$MODE" = check ]; then
         [ "$(getent shadow "$u" | cut -d: -f5)" = "$MAX_DAYS" ] || bad="$bad,$u"
     done
     [ -z "$bad" ] || problem "maxdays:${bad#,}"
+    badadm=""
+    for u in $(list_users); do
+        is_admin "$u" || continue
+        [ "$(getent shadow "$u" | cut -d: -f5)" != "$MAX_DAYS" ] || badadm="$badadm,$u"
+    done
+    [ -z "$badadm" ] || problem "admin-expires:${badadm#,}"
     if [ -z "$PROBLEMS" ]; then echo "COMPLIANT"; else echo "NON_COMPLIANT:$PROBLEMS"; fi
     exit 0
 fi
@@ -198,6 +204,19 @@ for u in $(list_regular); do
         note "user:$u"
     fi
 done
+
+# 5. Адміни: знімаємо термін дії, якщо він дорівнює MAX_DAYS (залишок старої версії або ручних змін).
+#    Інші значення (наприклад, виставлені навмисно) не чіпаємо. Дату зміни пароля не міняємо.
+for u in $(list_users); do
+    is_admin "$u" || continue
+    if [ "$(getent shadow "$u" | cut -d: -f5)" = "$MAX_DAYS" ]; then
+        chage -M 99999 "$u" && note "admin-unlimited:$u"
+    fi
+done
+# Системне значення за замовчуванням для нових акаунтів теж повертаємо, якщо його виставляла стара версія
+if grep -Eq "^PASS_MAX_DAYS[[:space:]]+$MAX_DAYS\$" /etc/login.defs; then
+    sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   99999/' /etc/login.defs && note "login.defs"
+fi
 
 if [ -z "$CHANGED" ]; then echo "ALREADY_APPLIED"; else echo "APPLIED_SUCCESS:$CHANGED"; fi
 exit 0
