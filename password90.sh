@@ -21,6 +21,7 @@ HISTORY=${HISTORY:-5}                 # скільки останніх паро
 ADMIN_GROUPS=${ADMIN_GROUPS:-"sudo admin wheel"}  # користувачі цих груп вважаються адмінами
 EXCLUDE_USERS=${EXCLUDE_USERS:-""}    # додаткові користувачі-винятки (через пробіл)
 SOFT_START=${SOFT_START:-1}           # 1: відлік терміну від дня застосування; 0: не чіпати дату зміни пароля
+ADMIN_BYPASS=${ADMIN_BYPASS:-1}       # 1: адміни пропускають перевірку довжини/складності пароля (pam_pwquality)
 MODE=${1:-apply}
 
 PAM=/etc/pam.d/common-password
@@ -83,12 +84,17 @@ difok = 4
 usercheck = 1
 dictcheck = 1"
 
+BYPASS_MARK="# pwpolicy-admin-bypass"
+
 # ===== Режим check =====
 if [ "$MODE" = check ]; then
     dpkg -s libpam-pwquality >/dev/null 2>&1 || problem "pkg"
     [ "$(cat "$PWQ_DROPIN" 2>/dev/null)" = "$PWQ_CONTENT" ] || problem "pwquality"
     grep -Eq '^password[[:space:]].*pam_pwquality\.so' "$PAM" 2>/dev/null || problem "pam-pwquality"
     grep -Eq "^password[[:space:]].*pam_unix\.so.*remember=$HISTORY( |\$)" "$PAM" 2>/dev/null || problem "history"
+    have=$(grep -c "$BYPASS_MARK" "$PAM" 2>/dev/null)
+    want=0; [ "$ADMIN_BYPASS" = 1 ] && want=$(( $(echo $ADMIN_GROUPS | wc -w) + 2 ))
+    [ "$have" = "$want" ] || problem "admin-bypass"
     bad=""
     for u in $(list_regular); do
         [ "$(getent shadow "$u" | cut -d: -f5)" = "$MAX_DAYS" ] || bad="$bad,$u"
@@ -133,9 +139,10 @@ if [ "$(cat "$PWQ_DROPIN" 2>/dev/null)" != "$PWQ_CONTENT" ]; then
     note "pwquality"
 fi
 
-# 3. PAM: pwquality та історія паролів (чіпаємо лише активні рядки, не коментарі)
+# 3. PAM: pwquality, історія паролів та обхід для адмінів (чіпаємо лише активні рядки)
 [ -e "$PAM.bak.policy" ] || cp -p "$PAM" "$PAM.bak.policy"
 BEFORE=$(cksum < "$PAM")
+sed -i "/$BYPASS_MARK/d" "$PAM"      # старі рядки обходу видаляємо, нові додамо в кінці
 if grep -Eq '^password[[:space:]].*pam_pwquality\.so' "$PAM"; then
     sed -Ei "/^password[[:space:]].*pam_pwquality\.so/s/minlen=[0-9]+/minlen=$MIN_LEN/" "$PAM"
 else
@@ -143,6 +150,38 @@ else
 fi
 sed -Ei "/^password[[:space:]].*pam_unix\.so/s/remember=[0-9]+/remember=$HISTORY/" "$PAM"
 sed -Ei "/^password[[:space:]].*pam_unix\.so/{/remember=/!s/\$/ remember=$HISTORY/}" "$PAM"
+
+# Обхід для адмінів. Адмін отримує власний рядок pam_unix (без use_authtok, obscure, remember),
+# бо pam_pwquality, який зазвичай запитує новий пароль, для нього пропускається.
+if [ "$ADMIN_BYPASS" = 1 ]; then
+    TMPPAM=$(mktemp)
+    awk -v groups="$ADMIN_GROUPS" -v mark="$BYPASS_MARK" '
+    { L[NR]=$0 }
+    END {
+        for (i=1;i<=NR;i++) if (L[i] ~ /^password[ \t]/) {
+            if (!pq && L[i] ~ /pam_pwquality\.so/) pq=i
+            if (!pu && L[i] ~ /pam_unix\.so/) pu=i
+            if (pq && pu && !pd && i>pu && L[i] ~ /pam_deny\.so/) pd=i
+        }
+        if (!pq || !pu || !pd) { for (i=1;i<=NR;i++) print L[i]; exit }
+        skip=0; for (i=pq;i<=pd;i++) if (L[i] ~ /^password[ \t]/) skip++
+        n=split(groups, G, " ")
+        opts=L[pu]; sub(/^.*pam_unix\.so[ \t]*/, "", opts)
+        gsub(/use_authtok|try_first_pass|obscure|remember=[0-9]+/, "", opts)
+        gsub(/[ \t]+/, " ", opts); gsub(/^ | $/, "", opts)
+        for (i=1;i<=NR;i++) {
+            if (i==pq) {
+                for (g=1; g<=n; g++) printf "password [success=%d default=ignore] pam_succeed_if.so quiet user ingroup %s %s\n", n-g+1, G[g], mark
+                printf "password [success=1 default=ignore] pam_succeed_if.so quiet uid >= 0 %s\n", mark
+                printf "password [success=%d default=die] pam_unix.so %s %s\n", skip, opts, mark
+            }
+            print L[i]
+        }
+    }' "$PAM" > "$TMPPAM" && cat "$TMPPAM" > "$PAM"
+    rm -f "$TMPPAM"
+    want=$(( $(echo $ADMIN_GROUPS | wc -w) + 2 ))
+    [ "$(grep -c "$BYPASS_MARK" "$PAM")" = "$want" ] || note "WARN:admin-bypass-not-applied(нестандартний PAM)"
+fi
 if ! grep -Eq '^password[[:space:]].*pam_unix\.so' "$PAM"; then
     cp -p "$PAM.bak.policy" "$PAM"
     echo "ERROR: PAM-файл пошкоджено, відновлено з копії"; exit 1
